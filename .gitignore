@@ -205,3 +205,144 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Executables
+*.exe
+# *.out
+*.app
+a.out
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Editor files
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build directories
+build/
+bin/
+
+# LaTeX intermediate files
+*.aux
+*.bbl
+*.blg
+*.brf
+*.idx
+*.ind
+*.lof
+*.toc
+*.log
+*.log
+
+
+# per non fillare il cluster
+# *.pdf
+# *.png
+
+# remove data folder from ViTs_exp
+src/ViTs_exp/data/
+
+data/
+
+*.npy
+*.npz
+
+# node modules
+node_modules/
+**/node_modules/
+
+
+##--------------------------------------------------------
+## LaTeX intermediate files
+##--------------------------------------------------------
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.brf
+*.idx
+*.ilg
+*.ind
+*.ist
+*.lof
+*.lot
+*.log
+*.nav
+*.out
+*.snm
+*.synctex.gz
+*.toc
+*.xdv
+*.xml
+*.bib
+
+# TikZ / PGFPlots externalization
+*.tikz
+*.pgf-plot.gnuplot
+*.gnuplot
+
+## glossaries
+*.acn
+*.acr
+*.alg
+*.glg
+*.glo
+*.gls
+
+## listings
+*.lol
+
+## makeidx
+*.maf
+*.mtc
+*.mtc0
+
+## minted (if used)
+_minted*/
+
+## latexmk
+*.fls
+*.fdb_latexmk
+
+# Python virtual environment
+.venv/
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+*.pdf
+src/Poli/README.md
