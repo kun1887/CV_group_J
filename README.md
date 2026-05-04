@@ -6,8 +6,9 @@ This repository contains a preprocessing and evaluation pipeline for:
 
 1. reading MIT-BIH ECG records with `wfdb`
 2. converting rhythm segments into ECG image frames suitable for V-JEPA-style video input
-3. converting saved frame sequences into cached V-JEPA embeddings
-4. evaluating those embeddings with unsupervised clustering and a supervised linear probe
+3. converting saved frame sequences into cached V-JEPA pooled segment embeddings
+4. converting saved frame sequences into cached V-JEPA clip embeddings
+5. evaluating pooled segment embeddings with unsupervised clustering and supervised baselines
 
 ## Pipeline Overview
 
@@ -17,11 +18,19 @@ The project is organized as a staged pipeline. Each stage writes files to disk s
 MIT-BIH WFDB records
 -> rhythm segments
 -> ECG frame sequences on disk
--> V-JEPA segment embeddings cache
--> clustering / linear probe experiments (for now)
+-> V-JEPA pooled segment embeddings cache
+-> clustering / linear probe / SVM experiments
+
+or
+
+MIT-BIH WFDB records
+-> rhythm segments
+-> ECG frame sequences on disk
+-> V-JEPA clip embeddings cache
+-> temporal sequence models (next step)
 ```
 
-There are three main execution stages:
+There are four main execution stages:
 
 1. `build_ecg_frames.py`
    - downloads MIT-BIH records if needed
@@ -34,9 +43,15 @@ There are three main execution stages:
    - pools clip embeddings into one embedding per segment
    - saves the embeddings locally in a cache file
 
-3. analysis scripts
+3. `build_vjepa_clip_embeddings.py`
+   - reads saved segment frame folders
+   - runs V-JEPA on fixed-length clips sampled from each segment
+   - saves one embedding per clip, with segment-aligned metadata
+
+4. analysis scripts
    - `clustering_with_embedding.py`
    - `linear_probe_with_embedding.py`
+   - `svm_with_embedding.py`
 
 ## Installation
 
@@ -143,6 +158,12 @@ What it does:
 - averages clip embeddings to obtain one embedding per segment
 - saves the result as a local `.npz` cache
 
+Important note:
+
+- V-JEPA computes one embedding per clip internally
+- this script then averages those clip embeddings
+- the saved cache contains one final embedding per segment, not one embedding per clip
+
 Recommended command:
 
 ```bash
@@ -175,7 +196,76 @@ python3 src/build_vjepa_embeddings.py \
   --force-recompute
 ```
 
-### 3. Clustering on Embeddings
+### 3. Build V-JEPA Clip Embeddings
+
+Script:
+
+- [src/build_vjepa_clip_embeddings.py](/Users/kunzhan/github/kun1887/CV_group_J/src/build_vjepa_clip_embeddings.py)
+
+Shared embedding utilities:
+
+- [src/vjepa_embedding_utils.py](/Users/kunzhan/github/kun1887/CV_group_J/src/vjepa_embedding_utils.py)
+
+What it does:
+
+- reads exported frame sequences from the dataset root
+- splits long segments into overlapping fixed-length clips
+- runs the V-JEPA encoder on those clips
+- saves one embedding per clip instead of pooling them to segment level
+- saves clip-level metadata so clips can be regrouped into ordered segment sequences later
+
+This stage is intended for temporal models such as:
+
+- LSTM
+- GRU
+- Transformer
+
+Recommended command:
+
+```bash
+python3 src/build_vjepa_clip_embeddings.py \
+  --dataset-root src/data/mitdb_vjepa_frames
+```
+
+By default it writes:
+
+- clip embedding cache directory:
+  [src/data/vjepa_clip_embedding_experiments/records](/Users/kunzhan/github/kun1887/CV_group_J/src/data/vjepa_clip_embedding_experiments/records)
+- clip embedding summary:
+  [src/data/vjepa_clip_embedding_experiments/embedding_summary.json](/Users/kunzhan/github/kun1887/CV_group_J/src/data/vjepa_clip_embedding_experiments/embedding_summary.json)
+
+Examples:
+
+- embed only selected records:
+
+```bash
+python3 src/build_vjepa_clip_embeddings.py \
+  --dataset-root src/data/mitdb_vjepa_frames \
+  --records 100 102 104
+```
+
+- force recomputation of the cache:
+
+```bash
+python3 src/build_vjepa_clip_embeddings.py \
+  --dataset-root src/data/mitdb_vjepa_frames \
+  --force-recompute
+```
+
+Each saved clip embedding row has aligned metadata fields such as:
+
+- `clip_record_names`
+- `clip_segment_ids`
+- `clip_labels`
+- `clip_label_text`
+- `clip_rhythms`
+- `clip_indices`
+- `clip_start_frames`
+- `clip_end_frames`
+
+The clip label is inherited from the parent segment. That is correct for the current dataset, because supervision is available at the segment level, not at the individual clip level.
+
+### 4. Clustering on Embeddings
 
 Script:
 
@@ -212,7 +302,7 @@ Outputs:
 - [clustering_results.csv](/Users/kunzhan/github/kun1887/CV_group_J/src/data/vjepa_embedding_experiments/clustering_results.csv)
 - PCA plots for true labels and each clustering method
 
-### 4. Linear Probe on Embeddings
+### 5. Linear Probe on Embeddings
 
 Script:
 
@@ -236,6 +326,33 @@ python3 src/linear_probe_with_embedding.py \
 Outputs:
 
 - [linear_probe_summary.json](/Users/kunzhan/github/kun1887/CV_group_J/src/data/vjepa_linear_probe/linear_probe_summary.json)
+- `leave_one_record_out_results.csv`
+- `true_labels_pca.png`
+
+### 6. SVM on Embeddings
+
+Script:
+
+- [src/svm_with_embedding.py](/Users/kunzhan/github/kun1887/CV_group_J/src/svm_with_embedding.py)
+
+What it does:
+
+- loads the saved pooled segment embedding cache
+- if needed, recomputes the cache through `vjepa_embedding_utils`
+- trains an SVM on raw V-JEPA embeddings
+- reports both stratified CV and leave-one-record-out evaluation
+
+Recommended command:
+
+```bash
+python3 src/svm_with_embedding.py \
+  --dataset-root src/data/mitdb_vjepa_frames \
+  --embedding-cache src/data/vjepa_embedding_experiments/records
+```
+
+Outputs:
+
+- [svm_summary.json](/Users/kunzhan/github/kun1887/CV_group_J/src/data/vjepa_svm/svm_summary.json)
 - `leave_one_record_out_results.csv`
 - `true_labels_pca.png`
 
@@ -272,6 +389,74 @@ Meaning:
 - one directory per record
 - one directory per rhythm segment
 - one PNG sequence per segment
+
+## Embedding Cache Layout
+
+There are now two embedding cache families.
+
+### Pooled Segment Embeddings
+
+Default location:
+
+- [src/data/vjepa_embedding_experiments/records](/Users/kunzhan/github/kun1887/CV_group_J/src/data/vjepa_embedding_experiments/records)
+
+Layout:
+
+```text
+src/data/vjepa_embedding_experiments/records/
+  100.npz
+  101.npz
+  102.npz
+  ...
+```
+
+Each record cache stores one row per segment:
+
+- `embeddings`
+- `record_names`
+- `segment_ids`
+- `labels`
+- `label_text`
+- `rhythms`
+
+### Clip Embeddings
+
+Default location:
+
+- [src/data/vjepa_clip_embedding_experiments/records](/Users/kunzhan/github/kun1887/CV_group_J/src/data/vjepa_clip_embedding_experiments/records)
+
+Layout:
+
+```text
+src/data/vjepa_clip_embedding_experiments/records/
+  100.npz
+  101.npz
+  102.npz
+  ...
+```
+
+Each record cache stores one row per clip in `embeddings`, together with clip-level and segment-level metadata.
+
+Clip-level fields:
+
+- `clip_record_names`
+- `clip_segment_ids`
+- `clip_labels`
+- `clip_label_text`
+- `clip_rhythms`
+- `clip_indices`
+- `clip_start_frames`
+- `clip_end_frames`
+
+Segment-level fields:
+
+- `segment_record_names`
+- `segment_ids`
+- `segment_labels`
+- `segment_label_text`
+- `segment_rhythms`
+- `segment_num_frames`
+- `segment_num_clips`
 
 Important metadata files:
 
