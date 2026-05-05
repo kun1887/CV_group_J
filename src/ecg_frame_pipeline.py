@@ -61,14 +61,22 @@ def ensure_records_available(
     annotation_extension: str,
 ) -> list[str]:
     data_dir.mkdir(parents=True, exist_ok=True)
+    record_names = list(record_names)
     missing_records = [
         record_name
         for record_name in record_names
         if not record_files_exist(data_dir, record_name, annotation_extension)
     ]
     if missing_records:
+        print(
+            f"Downloading {len(missing_records)} missing record(s) "
+            f"into {data_dir}: {', '.join(missing_records)}"
+        )
         wfdb.dl_database(db_name, dl_dir=str(data_dir), records=missing_records)
-    return list(record_names)
+        print("Download phase finished.")
+    else:
+        print(f"All {len(record_names)} requested record(s) are already available in {data_dir}.")
+    return record_names
 
 
 def load_record_bundle(data_dir: Path, record_name: str, annotation_extension: str) -> tuple[wfdb.Record, wfdb.Annotation]:
@@ -289,6 +297,7 @@ def export_record_frames(
 ) -> dict:
     record_dir = record_output_dir(output_root, record_name)
     if record_export_complete(output_root, record_name) and not config.overwrite:
+        print(f"Skipping record {record_name}: existing export found at {record_dir}.")
         return {
             "record_name": record_name,
             "status": "skipped_existing",
@@ -297,8 +306,10 @@ def export_record_frames(
         }
 
     if config.overwrite and record_dir.exists():
+        print(f"Overwriting existing export for record {record_name} at {record_dir}.")
         shutil.rmtree(record_dir)
 
+    print(f"Loading record {record_name} from {data_dir}.")
     record, annotation = load_record_bundle(data_dir, record_name, config.annotation_extension)
     if config.lead < 0 or config.lead >= record.p_signal.shape[1]:
         raise ValueError(
@@ -306,10 +317,15 @@ def export_record_frames(
         )
 
     segments = build_segments(record_name, record, annotation, config)
+    print(f"Record {record_name}: extracted {len(segments)} rhythm segment(s).")
     record_dir.mkdir(parents=True, exist_ok=True)
 
     exported_segments: list[dict] = []
     for segment in segments:
+        print(
+            f"Record {record_name}: exporting segment {segment['segment_id']} "
+            f"({segment['class']}, rhythm={segment['rhythm']}, duration={segment['duration_sec']:.2f}s)."
+        )
         frames, segment_meta = segment_to_frames(record, segment, config)
         segment_dir = record_dir / f"segment_{segment['segment_id']:04d}"
         frames_dir = segment_dir / "frames"
@@ -328,4 +344,5 @@ def export_record_frames(
         "config": asdict(config),
     }
     write_json(record_dir / "export_summary.json", export_summary)
+    print(f"Finished exporting record {record_name} to {record_dir}.")
     return export_summary

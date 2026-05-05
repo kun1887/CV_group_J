@@ -27,7 +27,11 @@ def uses_legacy_single_file_cache(cache_path: Path) -> bool:
 
 def resolve_device(device_arg: str) -> str:
     if device_arg == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
     return device_arg
 
 

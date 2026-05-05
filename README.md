@@ -5,7 +5,7 @@ Computer Vision 2025-2026 group project.
 This repository contains a preprocessing and evaluation pipeline for:
 
 1. reading MIT-BIH ECG records with `wfdb`
-2. converting rhythm segments into ECG image frames suitable for V-JEPA-style video input
+2. converting MIT-BIH rhythm segments or PTB-XL recordings into ECG image frames suitable for V-JEPA-style video input
 3. converting saved frame sequences into cached V-JEPA pooled segment embeddings
 4. converting saved frame sequences into cached V-JEPA clip embeddings
 5. evaluating pooled segment embeddings with unsupervised clustering and supervised baselines
@@ -23,6 +23,14 @@ MIT-BIH WFDB records
 
 or
 
+PTB-XL 100 Hz WFDB records
+-> one 10-second ECG recording treated as one segment
+-> ECG frame sequences on disk
+-> V-JEPA pooled segment embeddings cache
+-> downstream experiments
+
+or
+
 MIT-BIH WFDB records
 -> rhythm segments
 -> ECG frame sequences on disk
@@ -37,18 +45,23 @@ There are four main execution stages:
    - extracts rhythm segments from WFDB annotations
    - renders each segment into a sequence of ECG frames
 
-2. `build_vjepa_embeddings.py`
+2. `build_ptbxl_frames.py`
+   - downloads PTB-XL metadata and 100 Hz WFDB files
+   - treats each 10-second PTB-XL recording as one segment
+   - renders each recording into a sequence of ECG frames
+
+3. `build_vjepa_embeddings.py`
    - reads saved segment frame folders
    - runs V-JEPA on fixed-length clips sampled from each segment
    - pools clip embeddings into one embedding per segment
    - saves the embeddings locally in a cache file
 
-3. `build_vjepa_clip_embeddings.py`
+4. `build_vjepa_clip_embeddings.py`
    - reads saved segment frame folders
    - runs V-JEPA on fixed-length clips sampled from each segment
    - saves one embedding per clip, with segment-aligned metadata
 
-4. analysis scripts
+5. analysis scripts
    - `clustering_with_embedding.py`
    - `linear_probe_with_embedding.py`
    - `svm_with_embedding.py`
@@ -140,7 +153,58 @@ To keep the whole pipeline aligned, use:
 
 unless you also override the downstream `--dataset-root`.
 
-### 2. Build V-JEPA Embeddings
+### 2. Build PTB-XL Frames
+
+Script:
+
+- [src/build_ptbxl_frames.py](/Users/kunzhan/github/kun1887/CV_group_J/src/build_ptbxl_frames.py)
+
+Core rendering logic reused from:
+
+- [src/ecg_frame_pipeline.py](/Users/kunzhan/github/kun1887/CV_group_J/src/ecg_frame_pipeline.py)
+
+What it does:
+
+- downloads PTB-XL metadata files
+- downloads the 100 Hz WFDB waveform files referenced by `filename_lr`
+- treats each PTB-XL ECG recording as one segment
+- renders each 10-second recording into ECG frames
+- saves per-record metadata in the same general frame-export structure used by MIT-BIH
+
+Recommended command:
+
+```bash
+python3 src/build_ptbxl_frames.py
+```
+
+By default it writes:
+
+- raw PTB-XL files:
+  `src/data/ptbxl`
+- rendered frame dataset:
+  `src/data/ptbxl_vjepa_frames`
+
+Examples:
+
+- export only the first `n` PTB-XL records:
+
+```bash
+python3 src/build_ptbxl_frames.py --first-n 100
+```
+
+- export only selected PTB-XL `ecg_id` values:
+
+```bash
+python3 src/build_ptbxl_frames.py --records 1 2 3
+```
+
+Important note:
+
+- PTB-XL does not use MIT-BIH-style rhythm intervals in `aux_note`
+- each 10-second PTB-XL recording is treated as a single segment/sample
+- the downstream embedding scripts can be reused by pointing `--dataset-root` to `src/data/ptbxl_vjepa_frames`
+
+### 3. Build V-JEPA Embeddings
 
 Script:
 
@@ -196,7 +260,7 @@ python3 src/build_vjepa_embeddings.py \
   --force-recompute
 ```
 
-### 3. Build V-JEPA Clip Embeddings
+### 4. Build V-JEPA Clip Embeddings
 
 Script:
 
@@ -265,7 +329,7 @@ Each saved clip embedding row has aligned metadata fields such as:
 
 The clip label is inherited from the parent segment. That is correct for the current dataset, because supervision is available at the segment level, not at the individual clip level.
 
-### 4. Clustering on Embeddings
+### 5. Clustering on Embeddings
 
 Script:
 
@@ -302,7 +366,7 @@ Outputs:
 - [clustering_results.csv](/Users/kunzhan/github/kun1887/CV_group_J/src/data/vjepa_embedding_experiments/clustering_results.csv)
 - PCA plots for true labels and each clustering method
 
-### 5. Linear Probe on Embeddings
+### 6. Linear Probe on Embeddings
 
 Script:
 
@@ -329,7 +393,7 @@ Outputs:
 - `leave_one_record_out_results.csv`
 - `true_labels_pca.png`
 
-### 6. SVM on Embeddings
+### 7. SVM on Embeddings
 
 Script:
 
@@ -389,6 +453,23 @@ Meaning:
 - one directory per record
 - one directory per rhythm segment
 - one PNG sequence per segment
+
+PTB-XL exports follow the same directory shape, but each record contributes exactly one segment because each 10-second measurement is treated as one sample.
+
+Example:
+
+```text
+src/data/ptbxl_vjepa_frames/
+  run_summary.json
+  1/
+    export_summary.json
+    segments.csv
+    segment_0000/
+      metadata.json
+      frames/
+        frame_0000.png
+        ...
+```
 
 ## Embedding Cache Layout
 
@@ -477,6 +558,17 @@ Important metadata files:
     - beat counts
     - number of rendered frames
     - frame directory
+
+For PTB-XL exports, `metadata.json` also preserves source label information such as:
+
+- `ecg_id`
+- `patient_id`
+- `filename_lr`
+- `filename_hr`
+- `scp_codes`
+- `scp_codes_with_likelihood`
+- `report`
+- `strat_fold`
 
 ## Embedding Cache Layout
 

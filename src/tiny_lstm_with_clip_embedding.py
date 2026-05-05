@@ -26,6 +26,7 @@ class SegmentSequence:
     label_text: str
     rhythm: str
     clip_embeddings: np.ndarray
+    sequence_id: str | None = None
 
 
 class SegmentSequenceDataset(Dataset):
@@ -41,7 +42,7 @@ class SegmentSequenceDataset(Dataset):
             torch.from_numpy(item.clip_embeddings).float(),
             item.label_id,
             item.segment_id,
-            item.record_name,
+            item.sequence_id or item.record_name,
             len(item.clip_embeddings),
         )
 
@@ -93,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
         help="Device used for LSTM training and any embedding recomputation.",
     )
@@ -110,6 +111,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--held-out-record",
         help="Optional held-out record to evaluate on. If omitted, the most balanced eligible record is chosen automatically.",
+    )
+    parser.add_argument(
+        "--min-clips-per-segment",
+        type=int,
+        default=1,
+        help="Minimum number of clip embeddings required for a segment to be kept. Default keeps all segments.",
+    )
+    parser.add_argument(
+        "--train-subsequence-length",
+        type=int,
+        help=(
+            "Optional maximum number of clip embeddings per training sample. "
+            "If set, training segments longer than this are split into smaller subsequences."
+        ),
+    )
+    parser.add_argument(
+        "--train-subsequence-stride",
+        type=int,
+        help=(
+            "Stride between training subsequences in clip-embedding units. "
+            "Defaults to the subsequence length when --train-subsequence-length is set."
+        ),
     )
     parser.add_argument(
         "--target-num-frames",
@@ -303,6 +326,68 @@ def split_train_val(
     return train_items, val_items
 
 
+def split_long_training_sequences(
+    train_sequences: list[SegmentSequence],
+    subsequence_length: int | None,
+    subsequence_stride: int | None,
+) -> tuple[list[SegmentSequence], dict[str, int]]:
+    if subsequence_length is None:
+        return train_sequences, {
+            "raw_train_segments": len(train_sequences),
+            "effective_train_samples": len(train_sequences),
+            "segments_split": 0,
+            "generated_subsequences": 0,
+            "subsequence_length": 0,
+            "subsequence_stride": 0,
+        }
+
+    if subsequence_length < 1:
+        raise ValueError("--train-subsequence-length must be at least 1.")
+    stride = subsequence_stride if subsequence_stride is not None else subsequence_length
+    if stride < 1:
+        raise ValueError("--train-subsequence-stride must be at least 1.")
+
+    expanded: list[SegmentSequence] = []
+    segments_split = 0
+    generated_subsequences = 0
+
+    for item in train_sequences:
+        length = len(item.clip_embeddings)
+        if length <= subsequence_length:
+            expanded.append(item)
+            continue
+
+        segments_split += 1
+        start_indices = list(range(0, length - subsequence_length + 1, stride))
+        last_start = length - subsequence_length
+        if start_indices[-1] != last_start:
+            start_indices.append(last_start)
+
+        for subseq_index, start_idx in enumerate(start_indices):
+            end_idx = start_idx + subsequence_length
+            expanded.append(
+                SegmentSequence(
+                    record_name=item.record_name,
+                    segment_id=item.segment_id,
+                    label_id=item.label_id,
+                    label_text=item.label_text,
+                    rhythm=item.rhythm,
+                    clip_embeddings=item.clip_embeddings[start_idx:end_idx].astype(np.float32),
+                    sequence_id=f"{item.record_name}:{item.segment_id}:subseq_{subseq_index:03d}",
+                )
+            )
+            generated_subsequences += 1
+
+    return expanded, {
+        "raw_train_segments": len(train_sequences),
+        "effective_train_samples": len(expanded),
+        "segments_split": segments_split,
+        "generated_subsequences": generated_subsequences,
+        "subsequence_length": subsequence_length,
+        "subsequence_stride": stride,
+    }
+
+
 def collate_batch(batch: list[tuple[torch.Tensor, int, int, str, int]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[str]]:
     sequences = [item[0] for item in batch]
     labels = torch.tensor([item[1] for item in batch], dtype=torch.long)
@@ -421,6 +506,17 @@ def main() -> None:
 
     print("Phase 2/5: building segment-level clip sequences.")
     sequences = build_segment_sequences(clip_embeddings, clip_meta)
+    if args.min_clips_per_segment < 1:
+        raise ValueError("--min-clips-per-segment must be at least 1.")
+    if args.min_clips_per_segment > 1:
+        original_count = len(sequences)
+        sequences = [item for item in sequences if len(item.clip_embeddings) >= args.min_clips_per_segment]
+        print(
+            f"Filtered segments by min clip count: kept {len(sequences)} / {original_count} "
+            f"with at least {args.min_clips_per_segment} clip(s)."
+        )
+        if not sequences:
+            raise ValueError("No segment sequences remain after applying --min-clips-per-segment.")
     if len({item.label_id for item in sequences}) < 2:
         raise ValueError("Training requires both normal and not-normal segment labels.")
 
@@ -434,14 +530,26 @@ def main() -> None:
     if len({item.label_id for item in train_sequences}) < 2:
         raise ValueError("Training split does not contain both classes after applying the held-out record.")
 
-    train_sequences, val_sequences = split_train_val(train_sequences, args.val_fraction, args.seed)
+    raw_train_sequences, val_sequences = split_train_val(train_sequences, args.val_fraction, args.seed)
+    train_sequences, subsequence_summary = split_long_training_sequences(
+        raw_train_sequences,
+        args.train_subsequence_length,
+        args.train_subsequence_stride,
+    )
+    if args.train_subsequence_length is not None:
+        print(
+            f"Expanded long training segments into subsequences: "
+            f"{subsequence_summary['effective_train_samples']} training samples from "
+            f"{subsequence_summary['raw_train_segments']} train segment(s), "
+            f"{subsequence_summary['segments_split']} segment(s) split."
+        )
     train_sequences, normalized_other, mean, std = normalize_sequences(train_sequences, val_sequences + test_sequences)
     normalized_val = normalized_other[: len(val_sequences)]
     normalized_test = normalized_other[len(val_sequences) :]
 
     print(
         f"Held-out record: {held_out_record} | "
-        f"train segments={len(train_sequences)} val segments={len(normalized_val)} test segments={len(normalized_test)}"
+        f"train samples={len(train_sequences)} val segments={len(normalized_val)} test segments={len(normalized_test)}"
     )
 
     print("Phase 3/5: preparing loaders and tiny LSTM.")
@@ -523,15 +631,24 @@ def main() -> None:
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_f1": None if val_results is None else float(val_results["f1"]),
+                "val_accuracy": None if val_results is None else float(val_results["accuracy"]),
+                "val_precision": None if val_results is None else float(val_results["precision"]),
+                "val_recall": None if val_results is None else float(val_results["recall"]),
+                "val_roc_auc": None if val_results is None else val_results["roc_auc"],
             }
         )
         val_loss_text = "n/a" if val_loss is None else f"{val_loss:.4f}"
         val_f1_text = "n/a" if val_results is None else f"{monitor_value:.4f}"
+        val_score_preview = ""
+        if val_results is not None and len(val_results["scores"]) > 0:
+            preview_scores = ", ".join(f"{score:.3f}" for score in val_results["scores"][:5].tolist())
+            val_score_preview = f" val_score_not_normal[:5]=[{preview_scores}]"
         print(
             f"epoch={epoch:03d} "
             f"train_loss={train_loss:.4f} "
             f"val_loss={val_loss_text} "
             f"val_f1={val_f1_text}"
+            f"{val_score_preview}"
         )
 
         if monitor_value > best_score:
@@ -549,13 +666,17 @@ def main() -> None:
     model.load_state_dict(best_state)
 
     print("Phase 5/5: evaluating on the held-out record and saving outputs.")
+    val_results_final = evaluate_model(model, val_loader, device) if val_loader is not None else None
     test_results = evaluate_model(model, test_loader, device)
+    if val_results_final is not None:
+        save_prediction_rows(args.output_dir / "validation_predictions.csv", val_results_final)
     save_prediction_rows(args.output_dir / "held_out_predictions.csv", test_results)
 
     summary = {
         "held_out_record": held_out_record,
         "num_total_segments": len(sequences),
-        "num_train_segments": len(train_sequences),
+        "num_train_segments_before_subsequence_split": subsequence_summary["raw_train_segments"],
+        "num_train_samples_after_subsequence_split": len(train_sequences),
         "num_val_segments": len(normalized_val),
         "num_test_segments": len(normalized_test),
         "train_label_distribution": {
@@ -570,6 +691,10 @@ def main() -> None:
         "hidden_size": args.hidden_size,
         "num_layers": args.num_layers,
         "dropout": args.dropout,
+        "min_clips_per_segment": args.min_clips_per_segment,
+        "train_subsequence_length": args.train_subsequence_length,
+        "train_subsequence_stride": subsequence_summary["subsequence_stride"],
+        "segments_split_for_training": subsequence_summary["segments_split"],
         "epochs_requested": args.epochs,
         "epochs_ran": len(history),
         "learning_rate": args.lr,
@@ -580,6 +705,15 @@ def main() -> None:
             "recall": float(test_results["recall"]),
             "f1": float(test_results["f1"]),
             "roc_auc": None if test_results["roc_auc"] is None else float(test_results["roc_auc"]),
+        },
+        "validation_metrics": None
+        if val_results_final is None
+        else {
+            "accuracy": float(val_results_final["accuracy"]),
+            "precision": float(val_results_final["precision"]),
+            "recall": float(val_results_final["recall"]),
+            "f1": float(val_results_final["f1"]),
+            "roc_auc": None if val_results_final["roc_auc"] is None else float(val_results_final["roc_auc"]),
         },
         "confusion_matrix": test_results["confusion_matrix"],
         "normalization": {
