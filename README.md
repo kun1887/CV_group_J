@@ -420,6 +420,40 @@ Outputs:
 - `leave_one_record_out_results.csv`
 - `true_labels_pca.png`
 
+### 8. Tiny LSTM on Clip Embeddings
+
+Script:
+
+- [src/tiny_lstm_with_clip_embedding.py](/Users/kunzhan/github/kun1887/CV_group_J/src/tiny_lstm_with_clip_embedding.py)
+
+What it does:
+
+- loads saved clip embeddings
+- rebuilds ordered clip-embedding sequences per segment
+- trains a small LSTM segment classifier
+- saves validation and test predictions with `score_not_normal`
+
+Split behavior:
+
+- for MIT-BIH-style exports:
+  - uses one held-out record for test
+  - uses a random stratified validation split from the remaining records
+- for PTB-XL exports:
+  - automatically uses the native `strat_fold` split
+  - folds `1-8` train
+  - fold `9` validation
+  - fold `10` test
+  - `--held-out-record` and `--val-fraction` are ignored in this mode
+
+Example PTB-XL run:
+
+```bash
+python3 src/tiny_lstm_with_clip_embedding.py \
+  --dataset-root src/data/ptbxl_vjepa_frames \
+  --embedding-cache src/data/ptbxl_vjepa_clip_embedding_experiments/records \
+  --output-dir src/data/ptbxl_vjepa_tiny_lstm
+```
+
 ## Dataset Layout
 
 The saved frame dataset is organized by record, then by segment.

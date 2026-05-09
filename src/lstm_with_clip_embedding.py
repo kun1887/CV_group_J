@@ -26,6 +26,7 @@ class SegmentSequence:
     label_text: str
     rhythm: str
     clip_embeddings: np.ndarray
+    strat_fold: int | None = None
     sequence_id: str | None = None
 
 
@@ -228,7 +229,22 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_segment_sequences(clip_embeddings: np.ndarray, meta: dict[str, np.ndarray]) -> list[SegmentSequence]:
+def load_segment_metadata_fields(dataset_root: Path) -> dict[tuple[str, int], dict[str, object]]:
+    metadata_by_key: dict[tuple[str, int], dict[str, object]] = {}
+    for metadata_path in sorted(dataset_root.glob("*/segment_*/metadata.json")):
+        payload = json.loads(metadata_path.read_text())
+        key = (str(payload["record_name"]), int(payload["segment_id"]))
+        metadata_by_key[key] = payload
+    if not metadata_by_key:
+        raise ValueError(f"No segment metadata found under {dataset_root}.")
+    return metadata_by_key
+
+
+def build_segment_sequences(
+    clip_embeddings: np.ndarray,
+    meta: dict[str, np.ndarray],
+    dataset_root: Path,
+) -> list[SegmentSequence]:
     grouped: dict[tuple[str, int], list[tuple[int, np.ndarray]]] = {}
     clip_records = meta["clip_record_names"].tolist()
     clip_segment_ids = meta["clip_segment_ids"].tolist()
@@ -245,10 +261,17 @@ def build_segment_sequences(clip_embeddings: np.ndarray, meta: dict[str, np.ndar
         grouped.setdefault(key, []).append((int(clip_index), clip_embeddings[row_index]))
         sequence_meta[key] = (int(label_id), str(label_text), str(rhythm))
 
+    metadata_by_key = load_segment_metadata_fields(dataset_root)
     sequences: list[SegmentSequence] = []
     for record_name, segment_id in sorted(grouped):
         ordered_embeddings = [embedding for _, embedding in sorted(grouped[(record_name, segment_id)], key=lambda item: item[0])]
         label_id, label_text, rhythm = sequence_meta[(record_name, segment_id)]
+        metadata_payload = metadata_by_key.get((record_name, segment_id))
+        if metadata_payload is None:
+            raise ValueError(
+                f"Missing metadata.json for record {record_name} segment {segment_id} under {dataset_root}."
+            )
+        strat_fold = metadata_payload.get("strat_fold")
         sequences.append(
             SegmentSequence(
                 record_name=record_name,
@@ -257,6 +280,7 @@ def build_segment_sequences(clip_embeddings: np.ndarray, meta: dict[str, np.ndar
                 label_text=label_text,
                 rhythm=rhythm,
                 clip_embeddings=np.stack(ordered_embeddings, axis=0).astype(np.float32),
+                strat_fold=None if strat_fold is None else int(strat_fold),
             )
         )
     return sequences
@@ -302,6 +326,8 @@ def normalize_sequences(
                     label_text=item.label_text,
                     rhythm=item.rhythm,
                     clip_embeddings=((item.clip_embeddings - mean) / std).astype(np.float32),
+                    strat_fold=item.strat_fold,
+                    sequence_id=item.sequence_id,
                 )
             )
         return normalized
@@ -373,6 +399,7 @@ def split_long_training_sequences(
                     label_text=item.label_text,
                     rhythm=item.rhythm,
                     clip_embeddings=item.clip_embeddings[start_idx:end_idx].astype(np.float32),
+                    strat_fold=item.strat_fold,
                     sequence_id=f"{item.record_name}:{item.segment_id}:subseq_{subseq_index:03d}",
                 )
             )
@@ -484,6 +511,54 @@ def save_prediction_rows(path: Path, eval_results: dict[str, object]) -> None:
             )
 
 
+def resolve_split_strategy(sequences: list[SegmentSequence]) -> str:
+    strat_fold_presence = [item.strat_fold is not None for item in sequences]
+    if all(strat_fold_presence):
+        return "ptbxl_strat_fold"
+    if any(strat_fold_presence):
+        raise ValueError(
+            "Inconsistent segment metadata: some selected sequences have strat_fold and others do not. "
+            "Refuse to mix PTB-XL and non-PTB-XL split strategies."
+        )
+    return "held_out_record"
+
+
+def split_by_ptbxl_strat_fold(
+    sequences: list[SegmentSequence],
+) -> tuple[list[SegmentSequence], list[SegmentSequence], list[SegmentSequence], dict[str, list[int]]]:
+    train_folds = [1, 2, 3, 4, 5, 6, 7, 8]
+    validation_folds = [9]
+    test_folds = [10]
+
+    train_sequences = [item for item in sequences if item.strat_fold in train_folds]
+    val_sequences = [item for item in sequences if item.strat_fold in validation_folds]
+    test_sequences = [item for item in sequences if item.strat_fold in test_folds]
+
+    if not train_sequences:
+        raise ValueError("No PTB-XL training sequences remain after applying canonical strat_fold split.")
+    if not val_sequences:
+        raise ValueError("No PTB-XL validation sequences remain after applying canonical strat_fold split.")
+    if not test_sequences:
+        raise ValueError("No PTB-XL test sequences remain after applying canonical strat_fold split.")
+
+    for split_name, split_sequences in [
+        ("training", train_sequences),
+        ("validation", val_sequences),
+        ("test", test_sequences),
+    ]:
+        if len({item.label_id for item in split_sequences}) < 2:
+            raise ValueError(
+                f"PTB-XL {split_name} split does not contain both classes after filtering. "
+                f"Adjust the selected records or clip-count filter."
+            )
+
+    return train_sequences, val_sequences, test_sequences, {
+        "train_folds": train_folds,
+        "validation_folds": validation_folds,
+        "test_folds": test_folds,
+    }
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -505,7 +580,7 @@ def main() -> None:
     )
 
     print("Phase 2/5: building segment-level clip sequences.")
-    sequences = build_segment_sequences(clip_embeddings, clip_meta)
+    sequences = build_segment_sequences(clip_embeddings, clip_meta, args.dataset_root)
     if args.min_clips_per_segment < 1:
         raise ValueError("--min-clips-per-segment must be at least 1.")
     if args.min_clips_per_segment > 1:
@@ -520,17 +595,38 @@ def main() -> None:
     if len({item.label_id for item in sequences}) < 2:
         raise ValueError("Training requires both normal and not-normal segment labels.")
 
-    held_out_record = args.held_out_record or choose_balanced_held_out_record(sequences)
-    test_sequences = [item for item in sequences if item.record_name == held_out_record]
-    train_sequences = [item for item in sequences if item.record_name != held_out_record]
-    if not test_sequences:
-        raise ValueError(f"No sequences found for held-out record {held_out_record}.")
-    if len({item.label_id for item in test_sequences}) < 2:
-        raise ValueError(f"Held-out record {held_out_record} does not contain both classes.")
-    if len({item.label_id for item in train_sequences}) < 2:
-        raise ValueError("Training split does not contain both classes after applying the held-out record.")
+    split_strategy = resolve_split_strategy(sequences)
+    held_out_record: str | None = None
+    split_info: dict[str, list[int] | None] = {
+        "train_folds": None,
+        "validation_folds": None,
+        "test_folds": None,
+    }
 
-    raw_train_sequences, val_sequences = split_train_val(train_sequences, args.val_fraction, args.seed)
+    if split_strategy == "ptbxl_strat_fold":
+        print("Split strategy: ptbxl_strat_fold")
+        if args.held_out_record:
+            print("Note: --held-out-record is ignored for PTB-XL. Using canonical strat_fold split instead.")
+        print("Note: --val-fraction is ignored for PTB-XL. Validation uses strat_fold 9.")
+        raw_train_sequences, val_sequences, test_sequences, fold_info = split_by_ptbxl_strat_fold(sequences)
+        split_info.update(fold_info)
+        print(
+            f"Train folds: {','.join(str(fold) for fold in fold_info['train_folds'])} | "
+            f"Validation fold: {fold_info['validation_folds'][0]} | "
+            f"Test fold: {fold_info['test_folds'][0]}"
+        )
+    else:
+        held_out_record = args.held_out_record or choose_balanced_held_out_record(sequences)
+        test_sequences = [item for item in sequences if item.record_name == held_out_record]
+        train_sequences = [item for item in sequences if item.record_name != held_out_record]
+        if not test_sequences:
+            raise ValueError(f"No sequences found for held-out record {held_out_record}.")
+        if len({item.label_id for item in test_sequences}) < 2:
+            raise ValueError(f"Held-out record {held_out_record} does not contain both classes.")
+        if len({item.label_id for item in train_sequences}) < 2:
+            raise ValueError("Training split does not contain both classes after applying the held-out record.")
+        raw_train_sequences, val_sequences = split_train_val(train_sequences, args.val_fraction, args.seed)
+
     train_sequences, subsequence_summary = split_long_training_sequences(
         raw_train_sequences,
         args.train_subsequence_length,
@@ -547,10 +643,16 @@ def main() -> None:
     normalized_val = normalized_other[: len(val_sequences)]
     normalized_test = normalized_other[len(val_sequences) :]
 
-    print(
-        f"Held-out record: {held_out_record} | "
-        f"train samples={len(train_sequences)} val segments={len(normalized_val)} test segments={len(normalized_test)}"
-    )
+    if split_strategy == "ptbxl_strat_fold":
+        print(
+            f"train samples={len(train_sequences)} val segments={len(normalized_val)} "
+            f"test segments={len(normalized_test)}"
+        )
+    else:
+        print(
+            f"Held-out record: {held_out_record} | "
+            f"train samples={len(train_sequences)} val segments={len(normalized_val)} test segments={len(normalized_test)}"
+        )
 
     print("Phase 3/5: preparing loaders and tiny LSTM.")
     device = torch.device(resolve_device(args.device))
@@ -673,6 +775,10 @@ def main() -> None:
     save_prediction_rows(args.output_dir / "held_out_predictions.csv", test_results)
 
     summary = {
+        "split_strategy": split_strategy,
+        "train_folds": split_info["train_folds"],
+        "validation_folds": split_info["validation_folds"],
+        "test_folds": split_info["test_folds"],
         "held_out_record": held_out_record,
         "num_total_segments": len(sequences),
         "num_train_segments_before_subsequence_split": subsequence_summary["raw_train_segments"],
@@ -724,7 +830,15 @@ def main() -> None:
     }
     (args.output_dir / "tiny_lstm_summary.json").write_text(json.dumps(summary, indent=2))
 
-    print(f"Held-out record: {held_out_record}")
+    if split_strategy == "ptbxl_strat_fold":
+        print(
+            "Evaluation split: "
+            f"train folds {split_info['train_folds']}, "
+            f"validation folds {split_info['validation_folds']}, "
+            f"test folds {split_info['test_folds']}"
+        )
+    else:
+        print(f"Held-out record: {held_out_record}")
     print(
         "Test metrics: "
         f"accuracy={test_results['accuracy']:.3f} "

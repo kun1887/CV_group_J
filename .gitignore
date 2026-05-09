@@ -346,3 +346,6 @@ _minted*/
 
 *.pdf
 src/Poli/README.md
+
+# rysinc
+*.rsyncignore
