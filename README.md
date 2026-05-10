@@ -204,6 +204,43 @@ Important note:
 - each 10-second PTB-XL recording is treated as a single segment/sample
 - the downstream embedding scripts can be reused by pointing `--dataset-root` to `src/data/ptbxl_vjepa_frames`
 
+### 2bis. Multi-label Transformer baseline on raw PTB-XL ECG
+
+Script:
+
+- [src/transformer_ptbxl_multilabel.py](src/transformer_ptbxl_multilabel.py)
+
+What it does:
+
+- downloads PTB-XL metadata and 100 Hz WFDB files if missing
+- parses `scp_codes` and maps them to the five PTB-XL diagnostic super-classes
+  (`NORM`, `MI`, `STTC`, `CD`, `HYP`) using `scp_statements.csv`
+- skips records that have no diagnostic super-class label
+- splits records by the official `strat_fold` column:
+  - train: folds 1..8
+  - val: fold 9 (used for per-class threshold tuning)
+  - test: fold 10 (final reported metrics)
+- trains a Transformer encoder on raw lead-0 ECG (1s tokens, 256-d embedding,
+  4 layers, 8 heads, FFN=1024, CLS token, sinusoidal positional encoding) with
+  a multi-label head of 5 logits, `BCEWithLogitsLoss` and class-balanced
+  `pos_weight`, AdamW + cosine LR, gradient clipping, early stopping on val
+  macro-AUC
+- tunes per-class thresholds on fold 9 to maximize F1, then reports macro-AUC,
+  macro-F1, and per-class AUC/AP/precision/recall/F1/confusion matrix on fold 10
+- saves `summary.json` and `model.pt`
+
+Recommended command:
+
+```bash
+python3 src/transformer_ptbxl_multilabel.py
+```
+
+Quick smoke test on a small subset:
+
+```bash
+python3 src/transformer_ptbxl_multilabel.py --max-records 200 --epochs 3
+```
+
 ### 3. Build V-JEPA Embeddings
 
 Script:
