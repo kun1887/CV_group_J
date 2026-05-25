@@ -349,3 +349,6 @@ src/Poli/README.md
 
 # rysinc
 *.rsyncignore
+
+sweeps/
+wandb/

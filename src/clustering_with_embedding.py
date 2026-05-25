@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.cluster import AgglomerativeClustering, Birch, DBSCAN, KMeans, SpectralClustering
 from sklearn.decomposition import PCA
@@ -14,7 +13,7 @@ from sklearn.metrics import (
 )
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
-from vjepa_embedding_utils import ensure_embedding_cache
+from vjepa_embedding_utils import ensure_clip_embedding_cache, ensure_embedding_cache
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,7 +49,32 @@ def parse_args() -> argparse.Namespace:
         "--embedding-cache",
         type=Path,
         default=Path("src/data/vjepa_embedding_experiments/records"),
-        help="Embedding cache directory. One .npz file per record is expected unless a legacy .npz path is provided.",
+        help=(
+            "Embedding cache directory. In default mode this is a pooled embedding cache. "
+            "With --pool-record-clips, this is a per-record clip embedding cache."
+        ),
+    )
+    parser.add_argument(
+        "--pool-record-clips",
+        action="store_true",
+        help="Load clip embeddings and pool all clips from each record into one record embedding before clustering.",
+    )
+    parser.add_argument(
+        "--clip-pooling",
+        choices=("mean", "max"),
+        default="mean",
+        help="Pooling operation used with --pool-record-clips.",
+    )
+    parser.add_argument(
+        "--clip-value",
+        type=float,
+        default=1e6,
+        help="Absolute value used to clip embedding features before scaling and PCA.",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip PCA scatter plot generation.",
     )
     parser.add_argument(
         "--force-recompute",
@@ -58,6 +82,43 @@ def parse_args() -> argparse.Namespace:
         help="Ignore cached embeddings and recompute them.",
     )
     return parser.parse_args()
+
+
+def pool_clip_embeddings_by_record(
+    clip_embeddings: np.ndarray,
+    clip_meta: dict[str, np.ndarray],
+    pooling: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    record_names = clip_meta["clip_record_names"].astype(str)
+    labels = clip_meta["clip_labels"].astype(np.int32)
+    pooled_embeddings: list[np.ndarray] = []
+    pooled_labels: list[int] = []
+    pooled_record_names: list[str] = []
+
+    for record_name in sorted(set(record_names), key=lambda value: int(value) if value.isdigit() else value):
+        mask = record_names == record_name
+        record_embeddings = clip_embeddings[mask]
+        record_labels = np.unique(labels[mask])
+        if len(record_labels) != 1:
+            raise ValueError(f"Record {record_name} has inconsistent clip labels: {record_labels.tolist()}")
+
+        record_embeddings = np.nan_to_num(record_embeddings, nan=0.0, posinf=0.0, neginf=0.0)
+        if pooling == "mean":
+            pooled = record_embeddings.mean(axis=0, dtype=np.float64)
+        elif pooling == "max":
+            pooled = record_embeddings.max(axis=0)
+        else:
+            raise ValueError(f"Unsupported clip pooling method: {pooling}")
+
+        pooled_embeddings.append(pooled)
+        pooled_labels.append(int(record_labels[0]))
+        pooled_record_names.append(record_name)
+
+    return (
+        np.stack(pooled_embeddings).astype(np.float32),
+        np.array(pooled_labels, dtype=np.int32),
+        np.array(pooled_record_names),
+    )
 
 
 def cluster_purity(true_labels: np.ndarray, cluster_labels: np.ndarray) -> float:
@@ -154,12 +215,16 @@ def plot_assignments(
     assignments: dict[str, np.ndarray],
     output_dir: Path,
 ) -> None:
+    import matplotlib.pyplot as plt
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     plt.figure(figsize=(7, 6))
     label_names = np.where(true_labels == 0, "normal rhythm", "not-normal rhythm")
     for label_value, color, marker in [(1, "tab:red", "o"), (0, "tab:blue", "x")]:
         mask = true_labels == label_value
+        if not np.any(mask):
+            continue
         plt.scatter(projection[mask, 0], projection[mask, 1], color=color, marker=marker, s=55, alpha=0.75, label=label_names[mask][0])
     plt.title("Segment embeddings colored by true rhythm label")
     plt.xlabel("PC1")
@@ -187,30 +252,57 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     selected_records = set(args.records) if args.records else None
-    _, embeddings, labels, _ = ensure_embedding_cache(
-        dataset_root=args.dataset_root,
-        embedding_cache=args.embedding_cache,
-        selected_records=selected_records,
-        max_segments=args.max_segments,
-        model_name=args.model_name,
-        device_arg=args.device,
-        batch_size=args.batch_size,
-        target_num_frames=args.target_num_frames,
-        clip_stride=args.clip_stride,
-        force_recompute=args.force_recompute,
-    )
+    if args.pool_record_clips:
+        _, clip_embeddings, clip_meta = ensure_clip_embedding_cache(
+            dataset_root=args.dataset_root,
+            embedding_cache=args.embedding_cache,
+            selected_records=selected_records,
+            max_segments=args.max_segments,
+            model_name=args.model_name,
+            device_arg=args.device,
+            batch_size=args.batch_size,
+            target_num_frames=args.target_num_frames,
+            clip_stride=args.clip_stride,
+            force_recompute=args.force_recompute,
+        )
+        embeddings, labels, record_names = pool_clip_embeddings_by_record(
+            clip_embeddings,
+            clip_meta,
+            args.clip_pooling,
+        )
+        print(
+            f"Pooled {len(clip_embeddings)} clip embedding(s) into "
+            f"{len(record_names)} record embedding(s) using {args.clip_pooling} pooling."
+        )
+    else:
+        _, embeddings, labels, _ = ensure_embedding_cache(
+            dataset_root=args.dataset_root,
+            embedding_cache=args.embedding_cache,
+            selected_records=selected_records,
+            max_segments=args.max_segments,
+            model_name=args.model_name,
+            device_arg=args.device,
+            batch_size=args.batch_size,
+            target_num_frames=args.target_num_frames,
+            clip_stride=args.clip_stride,
+            force_recompute=args.force_recompute,
+        )
     if len(np.unique(labels)) < 2:
         raise ValueError("Clustering requires both normal and not-normal rhythm labels in the selected data.")
 
     scaler = StandardScaler()
+    embeddings = np.nan_to_num(embeddings.astype(np.float64), nan=0.0, posinf=args.clip_value, neginf=-args.clip_value)
+    embeddings = np.clip(embeddings, -args.clip_value, args.clip_value)
     scaled_embeddings = scaler.fit_transform(embeddings)
+    scaled_embeddings = np.nan_to_num(scaled_embeddings, nan=0.0, posinf=0.0, neginf=0.0)
     pca_dims = min(args.pca_dims, scaled_embeddings.shape[0], scaled_embeddings.shape[1])
-    reduced_embeddings = PCA(n_components=pca_dims, random_state=42).fit_transform(scaled_embeddings)
-    projection_2d = PCA(n_components=2, random_state=42).fit_transform(scaled_embeddings)
+    reduced_embeddings = PCA(n_components=pca_dims, random_state=42, svd_solver="full").fit_transform(scaled_embeddings)
+    projection_2d = PCA(n_components=2, random_state=42, svd_solver="full").fit_transform(scaled_embeddings)
 
     results, assignments = run_clustering_suite(reduced_embeddings, labels)
     save_results_table(results, args.output_dir / "clustering_results.csv")
-    plot_assignments(projection_2d, labels, assignments, args.output_dir)
+    if not args.no_plots:
+        plot_assignments(projection_2d, labels, assignments, args.output_dir)
 
     print("\nClustering results")
     for row in results:

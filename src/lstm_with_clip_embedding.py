@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,11 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 from vjepa_embedding_utils import ensure_clip_embedding_cache, resolve_device
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +109,11 @@ def parse_args() -> argparse.Namespace:
         "--records",
         nargs="+",
         help="Optional subset of exported records to use.",
+    )
+    parser.add_argument(
+        "--cached-only",
+        action="store_true",
+        help="Train only on records that already have cached per-record clip embeddings. Do not backfill missing caches.",
     )
     parser.add_argument(
         "--max-segments",
@@ -218,6 +229,50 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore cached clip embeddings and recompute them.",
     )
+    parser.add_argument(
+        "--tune-threshold-for-f1",
+        action="store_true",
+        help="Choose the classification threshold on validation by maximizing F1, then apply the same threshold to test.",
+    )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging for this training run.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default="ecg-vjepa-lstm",
+        help="Weights & Biases project name.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        help="Optional Weights & Biases entity/team name.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        help="Optional Weights & Biases run name.",
+    )
+    parser.add_argument(
+        "--wandb-group",
+        help="Optional Weights & Biases group for related runs.",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        nargs="+",
+        help="Optional Weights & Biases tags.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        choices=("online", "offline", "disabled"),
+        default="online",
+        help="Weights & Biases mode. Use offline if you want local logging without syncing immediately.",
+    )
+    parser.add_argument(
+        "--wandb-dir",
+        type=Path,
+        default=Path("src/data/wandb"),
+        help="Workspace-local directory for Weights & Biases run files and caches.",
+    )
     return parser.parse_args()
 
 
@@ -238,6 +293,17 @@ def load_segment_metadata_fields(dataset_root: Path) -> dict[tuple[str, int], di
     if not metadata_by_key:
         raise ValueError(f"No segment metadata found under {dataset_root}.")
     return metadata_by_key
+
+
+def load_cached_record_names(embedding_cache: Path) -> set[str]:
+    if embedding_cache.suffix == ".npz":
+        raise ValueError("--cached-only requires a per-record embedding cache directory, not a legacy single-file .npz.")
+    if not embedding_cache.exists():
+        raise ValueError(f"--cached-only was requested, but embedding cache directory does not exist: {embedding_cache}")
+    record_names = {path.stem for path in embedding_cache.glob("*.npz")}
+    if not record_names:
+        raise ValueError(f"--cached-only was requested, but no cached record embeddings were found in {embedding_cache}.")
+    return record_names
 
 
 def build_segment_sequences(
@@ -484,6 +550,58 @@ def evaluate_model(
     return results
 
 
+def compute_threshold_metrics(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+) -> dict[str, object]:
+    predictions = (scores >= threshold).astype(np.int32)
+    return {
+        "labels": labels,
+        "predictions": predictions,
+        "scores": scores,
+        "accuracy": float(accuracy_score(labels, predictions)),
+        "precision": float(precision_score(labels, predictions, zero_division=0)),
+        "recall": float(recall_score(labels, predictions, zero_division=0)),
+        "f1": float(f1_score(labels, predictions, zero_division=0)),
+        "roc_auc": float(roc_auc_score(labels, scores)) if len(np.unique(labels)) == 2 else None,
+        "confusion_matrix": confusion_matrix(labels, predictions).tolist(),
+        "threshold": float(threshold),
+    }
+
+
+def select_f1_threshold(labels: np.ndarray, scores: np.ndarray) -> float:
+    candidate_thresholds = np.unique(scores)
+    best_threshold = 0.5
+    best_f1 = -1.0
+
+    for threshold in candidate_thresholds.tolist():
+        metrics = compute_threshold_metrics(labels, scores, float(threshold))
+        f1 = float(metrics["f1"])
+        if f1 > best_f1 or (f1 == best_f1 and float(threshold) < best_threshold):
+            best_f1 = f1
+            best_threshold = float(threshold)
+
+    return best_threshold
+
+
+def apply_threshold_to_eval_results(eval_results: dict[str, object], threshold: float) -> dict[str, object]:
+    labels = np.asarray(eval_results["labels"], dtype=np.int32)
+    scores = np.asarray(eval_results["scores"], dtype=np.float32)
+    metrics = compute_threshold_metrics(labels, scores, threshold)
+    return {
+        **eval_results,
+        "predictions": metrics["predictions"],
+        "accuracy": metrics["accuracy"],
+        "precision": metrics["precision"],
+        "recall": metrics["recall"],
+        "f1": metrics["f1"],
+        "roc_auc": metrics["roc_auc"],
+        "confusion_matrix": metrics["confusion_matrix"],
+        "threshold": metrics["threshold"],
+    }
+
+
 def save_prediction_rows(path: Path, eval_results: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     labels = eval_results["labels"]
@@ -559,13 +677,108 @@ def split_by_ptbxl_strat_fold(
     }
 
 
+def maybe_init_wandb(
+    args: argparse.Namespace,
+    split_strategy: str,
+    held_out_record: str | None,
+    split_info: dict[str, list[int] | None],
+    total_segments: int,
+    raw_train_segments: int,
+    train_samples: int,
+    val_segments: int,
+    test_segments: int,
+    train_label_counts: dict[str, int],
+) -> object | None:
+    if not args.wandb or args.wandb_mode == "disabled":
+        return None
+    if wandb is None:
+        raise ImportError(
+            "Weights & Biases logging was requested, but `wandb` is not installed in this Python environment."
+        )
+    args.wandb_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = args.wandb_dir / "cache"
+    config_dir = args.wandb_dir / "config"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("WANDB_DIR", str(args.wandb_dir))
+    os.environ.setdefault("WANDB_CACHE_DIR", str(cache_dir))
+    os.environ.setdefault("WANDB_CONFIG_DIR", str(config_dir))
+
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=args.wandb_tags,
+        mode=args.wandb_mode,
+        dir=str(args.wandb_dir),
+        settings=wandb.Settings(start_method="thread", root_dir=str(args.wandb_dir)),
+        config={
+            "dataset_root": str(args.dataset_root),
+            "embedding_cache": str(args.embedding_cache),
+            "output_dir_base": str(args.output_dir),
+            "wandb_dir": str(args.wandb_dir),
+            "model_name": args.model_name,
+            "device": args.device,
+            "records": args.records,
+            "max_segments": args.max_segments,
+            "held_out_record": held_out_record,
+            "min_clips_per_segment": args.min_clips_per_segment,
+            "train_subsequence_length": args.train_subsequence_length,
+            "train_subsequence_stride": args.train_subsequence_stride,
+            "target_num_frames": args.target_num_frames,
+            "clip_stride": args.clip_stride,
+            "embedding_batch_size": args.embedding_batch_size,
+            "train_batch_size": args.train_batch_size,
+            "hidden_size": args.hidden_size,
+            "num_layers": args.num_layers,
+            "dropout": args.dropout,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "val_fraction": args.val_fraction,
+            "patience": args.patience,
+            "seed": args.seed,
+            "force_recompute": args.force_recompute,
+            "split_strategy": split_strategy,
+            "train_folds": split_info["train_folds"],
+            "validation_folds": split_info["validation_folds"],
+            "test_folds": split_info["test_folds"],
+            "num_total_segments": total_segments,
+            "num_train_segments_before_subsequence_split": raw_train_segments,
+            "num_train_samples_after_subsequence_split": train_samples,
+            "num_val_segments": val_segments,
+            "num_test_segments": test_segments,
+            "train_normal_rhythm": train_label_counts["normal_rhythm"],
+            "train_not_normal_rhythm": train_label_counts["not_normal_rhythm"],
+        },
+    )
+    wandb.define_metric("epoch")
+    wandb.define_metric("train_loss", step_metric="epoch")
+    wandb.define_metric("val_loss", step_metric="epoch")
+    wandb.define_metric("val_f1", step_metric="epoch")
+    wandb.define_metric("val_accuracy", step_metric="epoch")
+    wandb.define_metric("val_precision", step_metric="epoch")
+    wandb.define_metric("val_recall", step_metric="epoch")
+    wandb.define_metric("val_roc_auc", step_metric="epoch")
+    return run
+
+
 def main() -> None:
     args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     set_seed(args.seed)
+    base_output_dir = args.output_dir
 
     print("Phase 1/5: loading or building clip embeddings.")
     selected_records = set(args.records) if args.records else None
+    if args.cached_only:
+        cached_records = load_cached_record_names(args.embedding_cache)
+        selected_records = cached_records if selected_records is None else selected_records & cached_records
+        if not selected_records:
+            raise ValueError(
+                "--cached-only left no records to train on after intersecting cached records with --records selection."
+            )
+        print(f"Using cached-only mode: {len(selected_records)} record(s) selected from existing embedding caches.")
     _, clip_embeddings, clip_meta = ensure_clip_embedding_cache(
         dataset_root=args.dataset_root,
         embedding_cache=args.embedding_cache,
@@ -654,6 +867,28 @@ def main() -> None:
             f"train samples={len(train_sequences)} val segments={len(normalized_val)} test segments={len(normalized_test)}"
         )
 
+    train_label_counts = {
+        "normal_rhythm": int(sum(item.label_id == 0 for item in train_sequences)),
+        "not_normal_rhythm": int(sum(item.label_id == 1 for item in train_sequences)),
+    }
+    wandb_run = maybe_init_wandb(
+        args=args,
+        split_strategy=split_strategy,
+        held_out_record=held_out_record,
+        split_info=split_info,
+        total_segments=len(sequences),
+        raw_train_segments=subsequence_summary["raw_train_segments"],
+        train_samples=len(train_sequences),
+        val_segments=len(normalized_val),
+        test_segments=len(normalized_test),
+        train_label_counts=train_label_counts,
+    )
+    output_dir = base_output_dir / wandb_run.id if wandb_run is not None else base_output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if wandb_run is not None:
+        wandb.config.update({"output_dir": str(output_dir)}, allow_val_change=True)
+        print(f"W&B run: {wandb_run.project}/{wandb_run.id} | outputs -> {output_dir}")
+
     print("Phase 3/5: preparing loaders and tiny LSTM.")
     device = torch.device(resolve_device(args.device))
     train_loader = DataLoader(
@@ -696,6 +931,7 @@ def main() -> None:
     print("Phase 4/5: training.")
     best_state = None
     best_score = -np.inf
+    early_stopping_metric = "val_roc_auc"
     patience_counter = 0
     history: list[dict[str, float | int | None]] = []
 
@@ -720,7 +956,9 @@ def main() -> None:
         train_loss = total_loss / max(total_examples, 1)
         if val_loader is not None:
             val_results = evaluate_model(model, val_loader, device)
-            monitor_value = float(val_results["f1"])
+            if val_results["roc_auc"] is None:
+                raise ValueError("Validation ROC-AUC is unavailable; early stopping requires both classes in validation.")
+            monitor_value = float(val_results["roc_auc"])
             val_loss = float(val_results["loss"])
         else:
             val_results = None
@@ -739,8 +977,11 @@ def main() -> None:
                 "val_roc_auc": None if val_results is None else val_results["roc_auc"],
             }
         )
+        if wandb_run is not None:
+            wandb.log(history[-1])
         val_loss_text = "n/a" if val_loss is None else f"{val_loss:.4f}"
-        val_f1_text = "n/a" if val_results is None else f"{monitor_value:.4f}"
+        val_f1_text = "n/a" if val_results is None else f"{float(val_results['f1']):.4f}"
+        val_roc_auc_text = "n/a" if val_results is None else f"{monitor_value:.4f}"
         val_score_preview = ""
         if val_results is not None and len(val_results["scores"]) > 0:
             preview_scores = ", ".join(f"{score:.3f}" for score in val_results["scores"][:5].tolist())
@@ -749,7 +990,8 @@ def main() -> None:
             f"epoch={epoch:03d} "
             f"train_loss={train_loss:.4f} "
             f"val_loss={val_loss_text} "
-            f"val_f1={val_f1_text}"
+            f"val_f1={val_f1_text} "
+            f"val_roc_auc={val_roc_auc_text}"
             f"{val_score_preview}"
         )
 
@@ -770,9 +1012,21 @@ def main() -> None:
     print("Phase 5/5: evaluating on the held-out record and saving outputs.")
     val_results_final = evaluate_model(model, val_loader, device) if val_loader is not None else None
     test_results = evaluate_model(model, test_loader, device)
+    decision_threshold = 0.5
+    if args.tune_threshold_for_f1:
+        if val_results_final is None:
+            raise ValueError("--tune-threshold-for-f1 requires a validation split, but no validation loader is available.")
+        decision_threshold = select_f1_threshold(val_results_final["labels"], val_results_final["scores"])
+        val_results_final = apply_threshold_to_eval_results(val_results_final, decision_threshold)
+        test_results = apply_threshold_to_eval_results(test_results, decision_threshold)
+        print(f"Selected decision threshold on validation by max F1: {decision_threshold:.6f}")
+    else:
+        if val_results_final is not None:
+            val_results_final["threshold"] = decision_threshold
+        test_results["threshold"] = decision_threshold
     if val_results_final is not None:
-        save_prediction_rows(args.output_dir / "validation_predictions.csv", val_results_final)
-    save_prediction_rows(args.output_dir / "held_out_predictions.csv", test_results)
+        save_prediction_rows(output_dir / "validation_predictions.csv", val_results_final)
+    save_prediction_rows(output_dir / "held_out_predictions.csv", test_results)
 
     summary = {
         "split_strategy": split_strategy,
@@ -786,8 +1040,8 @@ def main() -> None:
         "num_val_segments": len(normalized_val),
         "num_test_segments": len(normalized_test),
         "train_label_distribution": {
-            "normal_rhythm": int((train_labels == 0).sum()),
-            "not_normal_rhythm": int((train_labels == 1).sum()),
+            "normal_rhythm": train_label_counts["normal_rhythm"],
+            "not_normal_rhythm": train_label_counts["not_normal_rhythm"],
         },
         "test_label_distribution": {
             "normal_rhythm": int((test_results["labels"] == 0).sum()),
@@ -803,14 +1057,19 @@ def main() -> None:
         "segments_split_for_training": subsequence_summary["segments_split"],
         "epochs_requested": args.epochs,
         "epochs_ran": len(history),
+        "early_stopping_metric": early_stopping_metric,
+        "best_validation_score": float(best_score),
         "learning_rate": args.lr,
         "weight_decay": args.weight_decay,
+        "tune_threshold_for_f1": args.tune_threshold_for_f1,
+        "decision_threshold": float(decision_threshold),
         "metrics": {
             "accuracy": float(test_results["accuracy"]),
             "precision": float(test_results["precision"]),
             "recall": float(test_results["recall"]),
             "f1": float(test_results["f1"]),
             "roc_auc": None if test_results["roc_auc"] is None else float(test_results["roc_auc"]),
+            "threshold": float(decision_threshold),
         },
         "validation_metrics": None
         if val_results_final is None
@@ -820,6 +1079,7 @@ def main() -> None:
             "recall": float(val_results_final["recall"]),
             "f1": float(val_results_final["f1"]),
             "roc_auc": None if val_results_final["roc_auc"] is None else float(val_results_final["roc_auc"]),
+            "threshold": float(decision_threshold),
         },
         "confusion_matrix": test_results["confusion_matrix"],
         "normalization": {
@@ -828,7 +1088,29 @@ def main() -> None:
         },
         "history": history,
     }
-    (args.output_dir / "tiny_lstm_summary.json").write_text(json.dumps(summary, indent=2))
+    (output_dir / "tiny_lstm_summary.json").write_text(json.dumps(summary, indent=2))
+    if wandb_run is not None:
+        wandb.summary["epochs_ran"] = len(history)
+        wandb.summary["early_stopping_metric"] = early_stopping_metric
+        wandb.summary["best_val_roc_auc"] = best_score
+        wandb.summary["test_accuracy"] = float(test_results["accuracy"])
+        wandb.summary["test_precision"] = float(test_results["precision"])
+        wandb.summary["test_recall"] = float(test_results["recall"])
+        wandb.summary["test_f1"] = float(test_results["f1"])
+        wandb.summary["test_roc_auc"] = None if test_results["roc_auc"] is None else float(test_results["roc_auc"])
+        wandb.summary["decision_threshold"] = float(decision_threshold)
+        if val_results_final is not None:
+            wandb.summary["final_val_accuracy"] = float(val_results_final["accuracy"])
+            wandb.summary["final_val_precision"] = float(val_results_final["precision"])
+            wandb.summary["final_val_recall"] = float(val_results_final["recall"])
+            wandb.summary["final_val_f1"] = float(val_results_final["f1"])
+            wandb.summary["final_val_roc_auc"] = (
+                None if val_results_final["roc_auc"] is None else float(val_results_final["roc_auc"])
+            )
+        wandb.save(str(output_dir / "tiny_lstm_summary.json"), base_path=str(output_dir))
+        if val_results_final is not None:
+            wandb.save(str(output_dir / "validation_predictions.csv"), base_path=str(output_dir))
+        wandb.save(str(output_dir / "held_out_predictions.csv"), base_path=str(output_dir))
 
     if split_strategy == "ptbxl_strat_fold":
         print(
@@ -845,9 +1127,12 @@ def main() -> None:
         f"precision={test_results['precision']:.3f} "
         f"recall={test_results['recall']:.3f} "
         f"f1={test_results['f1']:.3f} "
-        f"roc_auc={test_results['roc_auc'] if test_results['roc_auc'] is not None else 'n/a'}"
+        f"roc_auc={test_results['roc_auc'] if test_results['roc_auc'] is not None else 'n/a'} "
+        f"threshold={decision_threshold:.6f}"
     )
-    print(f"Saved results to {args.output_dir}")
+    print(f"Saved results to {output_dir}")
+    if wandb_run is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":
