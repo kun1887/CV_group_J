@@ -81,6 +81,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum heatmap alpha for strongest positive/negative patch contribution.",
     )
     parser.add_argument(
+        "--heatmap-mode",
+        choices=("contribution", "feature-norm"),
+        default="contribution",
+        help=(
+            "Patch heatmap value to visualize. `contribution` shows logistic not-normal score contribution; "
+            "`feature-norm` shows the V-JEPA token embedding norm. The top bar always uses logistic contributions."
+        ),
+    )
+    parser.add_argument(
         "--fps",
         type=float,
         help="Output video FPS. Defaults to 1 / seconds_per_frame from the record metadata.",
@@ -232,7 +241,8 @@ def compute_frame_heatmaps(
     target_num_frames: int,
     clip_stride: int,
     batch_size: int,
-) -> tuple[np.ndarray, dict[str, object]]:
+    heatmap_mode: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     device = torch.device(resolve_device(device_arg))
     torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
     processor = AutoVideoProcessor.from_pretrained(model_name)
@@ -244,7 +254,8 @@ def compute_frame_heatmaps(
         target_num_frames=target_num_frames,
         stride=clip_stride,
     )
-    frame_heatmaps: np.ndarray | None = None
+    visual_heatmaps: np.ndarray | None = None
+    score_heatmaps: np.ndarray | None = None
     frame_counts: np.ndarray | None = None
     token_grid: tuple[int, int, int] | None = None
     distributed_intercept = 0.0
@@ -258,35 +269,42 @@ def compute_frame_heatmaps(
             outputs = model(**inputs, skip_predictor=True)
             token_embeddings = outputs.last_hidden_state.float()
             contributions = torch.matmul(token_embeddings, raw_weight_tensor).cpu().numpy()
+            feature_norms = torch.linalg.vector_norm(token_embeddings, dim=-1).cpu().numpy()
 
             if token_grid is None:
                 token_grid = infer_token_grid(contributions.shape[1], target_num_frames, model)
                 _, grid_h, grid_w = token_grid
-                frame_heatmaps = np.zeros((len(frames), grid_h, grid_w), dtype=np.float64)
+                visual_heatmaps = np.zeros((len(frames), grid_h, grid_w), dtype=np.float64)
+                score_heatmaps = np.zeros((len(frames), grid_h, grid_w), dtype=np.float64)
                 frame_counts = np.zeros((len(frames), grid_h, grid_w), dtype=np.float64)
                 num_record_tokens = len(clips_with_meta) * contributions.shape[1]
                 distributed_intercept = raw_intercept / max(num_record_tokens, 1)
 
             contributions = contributions + distributed_intercept
+            visual_values = feature_norms if heatmap_mode == "feature-norm" else contributions
 
             temporal_grid, grid_h, grid_w = token_grid
             tubelet_size = max(1, target_num_frames // temporal_grid)
 
-            for clip_contrib, (_, start_frame, _) in zip(contributions, batch):
-                clip_grid = clip_contrib.reshape(temporal_grid, grid_h, grid_w)
+            for clip_visual, clip_score, (_, start_frame, _) in zip(visual_values, contributions, batch):
+                visual_grid = clip_visual.reshape(temporal_grid, grid_h, grid_w)
+                score_grid = clip_score.reshape(temporal_grid, grid_h, grid_w)
                 for local_frame in range(target_num_frames):
                     frame_index = start_frame + local_frame
                     if frame_index >= len(frames):
                         continue
                     temporal_index = min(local_frame // tubelet_size, temporal_grid - 1)
-                    frame_heatmaps[frame_index] += clip_grid[temporal_index]
+                    visual_heatmaps[frame_index] += visual_grid[temporal_index]
+                    score_heatmaps[frame_index] += score_grid[temporal_index]
                     frame_counts[frame_index] += 1.0
 
-    if frame_heatmaps is None or frame_counts is None or token_grid is None:
+    if visual_heatmaps is None or score_heatmaps is None or frame_counts is None or token_grid is None:
         raise RuntimeError("No frame heatmaps were computed.")
 
-    frame_heatmaps = frame_heatmaps / np.maximum(frame_counts, 1.0)
+    visual_heatmaps = visual_heatmaps / np.maximum(frame_counts, 1.0)
+    score_heatmaps = score_heatmaps / np.maximum(frame_counts, 1.0)
     metadata = {
+        "heatmap_mode": heatmap_mode,
         "num_clips": len(clips_with_meta),
         "token_grid": {
             "temporal": token_grid[0],
@@ -300,7 +318,7 @@ def compute_frame_heatmaps(
             "positive values support the logistic not-normal direction after adding the distributed intercept share"
         ),
     }
-    return frame_heatmaps.astype(np.float32), metadata
+    return visual_heatmaps.astype(np.float32), score_heatmaps.astype(np.float32), metadata
 
 
 def save_video(
@@ -394,7 +412,7 @@ def main() -> None:
     raw_intercept = float(params["raw_intercept"])
     threshold = float(params["threshold"])
 
-    frame_heatmaps, heatmap_metadata = compute_frame_heatmaps(
+    frame_heatmaps, score_heatmaps, heatmap_metadata = compute_frame_heatmaps(
         frames=frames,
         model_name=args.model_name,
         device_arg=args.device,
@@ -403,13 +421,15 @@ def main() -> None:
         target_num_frames=args.target_num_frames,
         clip_stride=args.clip_stride,
         batch_size=args.batch_size,
+        heatmap_mode=args.heatmap_mode,
     )
     fps = args.fps if args.fps is not None else 1.0 / float(metadata["seconds_per_frame"])
     seconds_per_frame = float(metadata["seconds_per_frame"])
     record_name = metadata["record_name"]
     safe_label = "not_normal" if label_text == "not-normal rhythm" else "normal"
-    output_path = args.output_dir / f"record_{record_name}_{safe_label}_logistic_patch_contributions.mp4"
-    frame_contributions = frame_heatmaps.mean(axis=(1, 2))
+    mode_suffix = args.heatmap_mode.replace("-", "_")
+    output_path = args.output_dir / f"record_{record_name}_{safe_label}_{mode_suffix}_logistic_patch_contributions.mp4"
+    frame_contributions = score_heatmaps.mean(axis=(1, 2))
     cumulative_scores = compute_cumulative_scores(frame_contributions, raw_intercept, threshold)
     cumulative_margins = np.asarray(cumulative_scores["cumulative_margin_to_threshold"])
     global_heatmap_max_abs, cumulative_margin_max_abs = save_video(
