@@ -1,6 +1,6 @@
-Here's the best run from `ptbxl-transformer-auc-sweep`:
+*Transformer on row ecg*
 
----
+Here's the best run from `ptbxl-transformer-auc-sweep`:
 
 **Best run:** `run-20260519_152650-yxdmrauy`
 
@@ -25,7 +25,7 @@ The sweep ran 10 runs total. `window_sec` and other fixed params weren't part of
 
 Note: the `ptbxl-mlp-auc-sweep` runs the MLP on **V-JEPA embeddings** (not raw ECG), since that's what `ptbxl_mlp.py` uses. Here's the best run:
 
----
+*MLP on V-JEPA embeddings*
 
 **Best run:** `run-20260518_150333-5xy1jv5s`
 
@@ -46,7 +46,7 @@ Note: the `ptbxl-mlp-auc-sweep` runs the MLP on **V-JEPA embeddings** (not raw E
 
 The sweep was tight — all 10 runs clustered between 0.860–0.868 val AUC. The V-JEPA + MLP best (0.8676) slightly edges out the raw transformer best (0.8566).
 
-*LSTM on jepa*
+* LSTM on V-JEPA embeddings *
 
 **Best run:** `7x6xq4al`
 
