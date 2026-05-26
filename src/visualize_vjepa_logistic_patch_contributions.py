@@ -90,6 +90,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--feature-source",
+        choices=("post-layernorm", "pre-layernorm"),
+        default="post-layernorm",
+        help=(
+            "V-JEPA token features used for the `feature-norm` background. `post-layernorm` uses the standard "
+            "model output; `pre-layernorm` captures the last encoder hidden layer before the final LayerNorm. "
+            "Logistic contribution scores and the top bar always use post-LayerNorm features."
+        ),
+    )
+    parser.add_argument(
         "--fps",
         type=float,
         help="Output video FPS. Defaults to 1 / seconds_per_frame from the record metadata.",
@@ -148,6 +158,47 @@ def infer_token_grid(num_tokens: int, target_num_frames: int, model: torch.nn.Mo
     )
 
 
+def resolve_final_encoder_layernorm(model: torch.nn.Module) -> torch.nn.Module:
+    candidates = [
+        getattr(getattr(model, "encoder", None), "layernorm", None),
+        getattr(getattr(getattr(model, "vjepa2", None), "encoder", None), "layernorm", None),
+        getattr(getattr(getattr(model, "model", None), "encoder", None), "layernorm", None),
+    ]
+    for layernorm in candidates:
+        if layernorm is not None:
+            return layernorm
+    raise AttributeError("Could not find the final encoder LayerNorm on the loaded V-JEPA model.")
+
+
+def extract_visual_and_score_token_embeddings(
+    model: torch.nn.Module,
+    inputs: dict[str, torch.Tensor],
+    visual_feature_source: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if visual_feature_source == "post-layernorm":
+        outputs = model(**inputs, skip_predictor=True)
+        post_layernorm_embeddings = outputs.last_hidden_state.float()
+        return post_layernorm_embeddings, post_layernorm_embeddings
+
+    captured: dict[str, torch.Tensor] = {}
+    layernorm = resolve_final_encoder_layernorm(model)
+
+    def capture_pre_layernorm(_module: torch.nn.Module, hook_inputs: tuple[torch.Tensor, ...]) -> None:
+        captured["hidden_states"] = hook_inputs[0]
+
+    handle = layernorm.register_forward_pre_hook(capture_pre_layernorm)
+    try:
+        outputs = model(**inputs, skip_predictor=True)
+    finally:
+        handle.remove()
+
+    if "hidden_states" not in captured:
+        raise RuntimeError("Failed to capture pre-LayerNorm V-JEPA token embeddings.")
+    visual_embeddings = captured["hidden_states"].float()
+    score_embeddings = outputs.last_hidden_state.float()
+    return visual_embeddings, score_embeddings
+
+
 def overlay_signed_heatmap(
     frame: np.ndarray,
     heatmap: np.ndarray,
@@ -169,6 +220,27 @@ def overlay_signed_heatmap(
     color[..., 2] = 255.0 * negative
     alpha_map = (alpha * magnitude)[..., np.newaxis]
     blended = frame_float * (1.0 - alpha_map) + color * alpha_map
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def overlay_viridis_heatmap(
+    frame: np.ndarray,
+    heatmap: np.ndarray,
+    alpha: float,
+    scale_min: float,
+    scale_max: float,
+) -> np.ndarray:
+    frame_float = to_white_background_black_trace(frame).astype(np.float32)
+    heatmap = heatmap.astype(np.float32)
+    if scale_max - scale_min <= 1e-12:
+        return frame_float.astype(np.uint8)
+
+    normalized = np.clip((heatmap - scale_min) / (scale_max - scale_min), 0.0, 1.0)
+    heatmap_uint8 = np.round(normalized * 255.0).astype(np.uint8)
+    viridis_bgr = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_VIRIDIS)
+    viridis_rgb = cv2.cvtColor(viridis_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    alpha_map = (alpha * normalized)[..., np.newaxis]
+    blended = frame_float * (1.0 - alpha_map) + viridis_rgb * alpha_map
     return np.clip(blended, 0, 255).astype(np.uint8)
 
 
@@ -242,6 +314,7 @@ def compute_frame_heatmaps(
     clip_stride: int,
     batch_size: int,
     heatmap_mode: str,
+    feature_source: str,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     device = torch.device(resolve_device(device_arg))
     torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
@@ -266,10 +339,9 @@ def compute_frame_heatmaps(
             batch = clips_with_meta[batch_start : batch_start + batch_size]
             batch_clips = [clip for clip, _, _ in batch]
             inputs = processor(batch_clips, return_tensors="pt").to(device)
-            outputs = model(**inputs, skip_predictor=True)
-            token_embeddings = outputs.last_hidden_state.float()
-            contributions = torch.matmul(token_embeddings, raw_weight_tensor).cpu().numpy()
-            feature_norms = torch.linalg.vector_norm(token_embeddings, dim=-1).cpu().numpy()
+            visual_embeddings, score_embeddings = extract_visual_and_score_token_embeddings(model, inputs, feature_source)
+            contributions = torch.matmul(score_embeddings, raw_weight_tensor).cpu().numpy()
+            feature_norms = torch.linalg.vector_norm(visual_embeddings, dim=-1).cpu().numpy()
 
             if token_grid is None:
                 token_grid = infer_token_grid(contributions.shape[1], target_num_frames, model)
@@ -305,6 +377,8 @@ def compute_frame_heatmaps(
     score_heatmaps = score_heatmaps / np.maximum(frame_counts, 1.0)
     metadata = {
         "heatmap_mode": heatmap_mode,
+        "feature_source": feature_source,
+        "score_feature_source": "post-layernorm",
         "num_clips": len(clips_with_meta),
         "token_grid": {
             "temporal": token_grid[0],
@@ -328,6 +402,7 @@ def save_video(
     cumulative_margins: np.ndarray,
     fps: float,
     alpha: float,
+    heatmap_mode: str,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     height, width = frames.shape[1:3]
@@ -341,15 +416,26 @@ def save_video(
         raise RuntimeError(f"Failed to open video writer for {output_path}.")
 
     global_max_abs = float(np.max(np.abs(frame_heatmaps)))
+    global_min = float(np.min(frame_heatmaps))
+    global_max = float(np.max(frame_heatmaps))
     cumulative_margin_max_abs = float(np.max(np.abs(cumulative_margins)))
     for frame, heatmap, cumulative_margin in zip(frames, frame_heatmaps, cumulative_margins):
         heatmap_resized = cv2.resize(heatmap, (width, height), interpolation=cv2.INTER_CUBIC)
-        overlaid = overlay_signed_heatmap(frame, heatmap_resized, alpha=alpha, scale_max_abs=global_max_abs)
+        if heatmap_mode == "feature-norm":
+            overlaid = overlay_viridis_heatmap(
+                frame,
+                heatmap_resized,
+                alpha=alpha,
+                scale_min=global_min,
+                scale_max=global_max,
+            )
+        else:
+            overlaid = overlay_signed_heatmap(frame, heatmap_resized, alpha=alpha, scale_max_abs=global_max_abs)
         overlaid = draw_cumulative_score_bar(overlaid, float(cumulative_margin), cumulative_margin_max_abs)
         writer.write(cv2.cvtColor(overlaid, cv2.COLOR_RGB2BGR))
 
     writer.release()
-    return global_max_abs, cumulative_margin_max_abs
+    return global_max_abs, cumulative_margin_max_abs, global_min, global_max
 
 
 def save_frame_contributions(
@@ -422,6 +508,7 @@ def main() -> None:
         clip_stride=args.clip_stride,
         batch_size=args.batch_size,
         heatmap_mode=args.heatmap_mode,
+        feature_source=args.feature_source,
     )
     fps = args.fps if args.fps is not None else 1.0 / float(metadata["seconds_per_frame"])
     seconds_per_frame = float(metadata["seconds_per_frame"])
@@ -432,13 +519,14 @@ def main() -> None:
     frame_contributions = score_heatmaps.mean(axis=(1, 2))
     cumulative_scores = compute_cumulative_scores(frame_contributions, raw_intercept, threshold)
     cumulative_margins = np.asarray(cumulative_scores["cumulative_margin_to_threshold"])
-    global_heatmap_max_abs, cumulative_margin_max_abs = save_video(
+    global_heatmap_max_abs, cumulative_margin_max_abs, global_heatmap_min, global_heatmap_max = save_video(
         output_path,
         frames,
         frame_heatmaps,
         cumulative_margins,
         fps=fps,
         alpha=args.alpha,
+        heatmap_mode=args.heatmap_mode,
     )
     frame_contributions_path = output_path.with_name(f"{output_path.stem}_frame_contributions.csv")
     save_frame_contributions(frame_contributions_path, frame_contributions, cumulative_scores, threshold, seconds_per_frame)
@@ -458,8 +546,15 @@ def main() -> None:
         "clip_stride": int(args.clip_stride),
         "raw_intercept": raw_intercept,
         "threshold": threshold,
-        "heatmap_color_scale": "global_max_abs_across_record_frames",
+        "feature_source": args.feature_source,
+        "heatmap_color_scale": (
+            "global_min_max_viridis_across_record_frames"
+            if args.heatmap_mode == "feature-norm"
+            else "global_max_abs_across_record_frames"
+        ),
         "global_heatmap_max_abs": global_heatmap_max_abs,
+        "global_heatmap_min": global_heatmap_min,
+        "global_heatmap_max": global_heatmap_max,
         "cumulative_score_bar": {
             "meaning": (
                 "red means the cumulative record score up to this frame is above the tuned not-normal threshold; "
