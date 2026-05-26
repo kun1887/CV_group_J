@@ -46,4 +46,23 @@ Note: the `ptbxl-mlp-auc-sweep` runs the MLP on **V-JEPA embeddings** (not raw E
 
 The sweep was tight — all 10 runs clustered between 0.860–0.868 val AUC. The V-JEPA + MLP best (0.8676) slightly edges out the raw transformer best (0.8566).
 
+*LSTM on jepa*
 
+**Best run:** `7x6xq4al`
+
+hidden_size: 256
+num_layers: 4
+dropout: 0.0
+learning_rate: 0.00010737973286267166
+weight_decay: 0.0001
+train_batch_size: 128
+epochs_requested: 60
+epochs_ran: 15
+early_stopping_metric: val_roc_auc
+best_epoch: 5
+
+val_roc_auc: 0.856269
+val_f1:      0.811583
+val_recall:  0.872977
+val_precision: 0.758257
+threshold:   0.282760
