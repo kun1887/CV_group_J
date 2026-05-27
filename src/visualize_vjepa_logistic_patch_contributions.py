@@ -82,11 +82,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--heatmap-mode",
-        choices=("contribution", "feature-norm"),
+        choices=("contribution", "feature-norm", "cosine"),
         default="contribution",
         help=(
             "Patch heatmap value to visualize. `contribution` shows logistic not-normal score contribution; "
-            "`feature-norm` shows the V-JEPA token embedding norm. The top bar always uses logistic contributions."
+            "`feature-norm` shows the V-JEPA token embedding norm; `cosine` shows directional alignment between "
+            "each patch token and the logistic not-normal weight vector. The top bar always uses logistic contributions."
         ),
     )
     parser.add_argument(
@@ -96,7 +97,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "V-JEPA token features used for the `feature-norm` background. `post-layernorm` uses the standard "
             "model output; `pre-layernorm` captures the last encoder hidden layer before the final LayerNorm. "
-            "Logistic contribution scores and the top bar always use post-LayerNorm features."
+            "Logistic contribution scores, cosine alignment, and the top bar always use post-LayerNorm features."
         ),
     )
     parser.add_argument(
@@ -333,6 +334,7 @@ def compute_frame_heatmaps(
     token_grid: tuple[int, int, int] | None = None
     distributed_intercept = 0.0
     raw_weight_tensor = torch.from_numpy(raw_weight.astype(np.float32)).to(device)
+    raw_weight_norm = torch.linalg.vector_norm(raw_weight_tensor).clamp_min(1e-12)
 
     with torch.no_grad():
         for batch_start in range(0, len(clips_with_meta), batch_size):
@@ -342,6 +344,10 @@ def compute_frame_heatmaps(
             visual_embeddings, score_embeddings = extract_visual_and_score_token_embeddings(model, inputs, feature_source)
             contributions = torch.matmul(score_embeddings, raw_weight_tensor).cpu().numpy()
             feature_norms = torch.linalg.vector_norm(visual_embeddings, dim=-1).cpu().numpy()
+            score_embedding_norms = torch.linalg.vector_norm(score_embeddings, dim=-1).clamp_min(1e-12)
+            cosine_alignments = (
+                torch.matmul(score_embeddings, raw_weight_tensor) / (score_embedding_norms * raw_weight_norm)
+            ).cpu().numpy()
 
             if token_grid is None:
                 token_grid = infer_token_grid(contributions.shape[1], target_num_frames, model)
@@ -353,7 +359,12 @@ def compute_frame_heatmaps(
                 distributed_intercept = raw_intercept / max(num_record_tokens, 1)
 
             contributions = contributions + distributed_intercept
-            visual_values = feature_norms if heatmap_mode == "feature-norm" else contributions
+            if heatmap_mode == "feature-norm":
+                visual_values = feature_norms
+            elif heatmap_mode == "cosine":
+                visual_values = cosine_alignments
+            else:
+                visual_values = contributions
 
             temporal_grid, grid_h, grid_w = token_grid
             tubelet_size = max(1, target_num_frames // temporal_grid)
@@ -379,6 +390,7 @@ def compute_frame_heatmaps(
         "heatmap_mode": heatmap_mode,
         "feature_source": feature_source,
         "score_feature_source": "post-layernorm",
+        "cosine_sign": "positive values mean patch tokens point toward the logistic not-normal weight direction",
         "num_clips": len(clips_with_meta),
         "token_grid": {
             "temporal": token_grid[0],
