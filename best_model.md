@@ -1,4 +1,5 @@
-*Transformer on row ecg*
+# Best Models Parameters by Architecture
+## *Transformer on raw ecg*
 
 Here's the best run from `ptbxl-transformer-auc-sweep`:
 
@@ -25,7 +26,7 @@ The sweep ran 10 runs total. `window_sec` and other fixed params weren't part of
 
 Note: the `ptbxl-mlp-auc-sweep` runs the MLP on **V-JEPA embeddings** (not raw ECG), since that's what `ptbxl_mlp.py` uses. Here's the best run:
 
-*MLP on V-JEPA embeddings*
+## *MLP on V-JEPA embeddings*
 
 **Best run:** `run-20260518_150333-5xy1jv5s`
 
@@ -46,23 +47,29 @@ Note: the `ptbxl-mlp-auc-sweep` runs the MLP on **V-JEPA embeddings** (not raw E
 
 The sweep was tight — all 10 runs clustered between 0.860–0.868 val AUC. The V-JEPA + MLP best (0.8676) slightly edges out the raw transformer best (0.8566).
 
-* LSTM on V-JEPA embeddings *
+## *LSTM on V-JEPA embeddings*
 
 **Best run:** `7x6xq4al`
 
-hidden_size: 256
-num_layers: 4
-dropout: 0.0
-learning_rate: 0.00010737973286267166
-weight_decay: 0.0001
-train_batch_size: 128
-epochs_requested: 60
-epochs_ran: 15
-early_stopping_metric: val_roc_auc
-best_epoch: 5
+| Metric | Value |
+| --- | --- |
+| **val_roc_auc** | **0.8563** |
+| val_f1 | 0.8116 |
+| val_recall | 0.8730 |
+| val_precision | 0.7583 |
+| threshold | 0.2828 |
 
-val_roc_auc: 0.856269
-val_f1:      0.811583
-val_recall:  0.872977
-val_precision: 0.758257
-threshold:   0.282760
+**Hyperparameters:**
+
+| Parameter | Value |
+| --- | --- |
+| hidden_size | 256 |
+| num_layers | 4 |
+| dropout | 0.0 |
+| learning_rate | 0.000107 |
+| weight_decay | 0.0001 |
+| train_batch_size | 128 |
+| epochs_requested | 60 |
+| epochs_ran | 15 |
+| early_stopping_metric | `val_roc_auc` |
+| best_epoch | 5 |
