@@ -145,6 +145,37 @@ python src/ptbxl_transformer.py \
   --output-dir src/data/ptbxl_results/transformer
 ```
 
+## 7. Visualization Utilities (demo)
+
+Responsible scripts:
+
+```text
+src/plot_record_frames.py
+src/visualize_vjepa_logistic_patch_contributions.py
+```
+
+`src/plot_record_frames.py` displays or saves exported ECG frames as clean white-background plots. It can concatenate all frames of one or more records into rows, or show selected single frames. Normal records are colored green and not-normal records red unless black rendering is requested.
+
+Representative command:
+
+```bash
+python src/plot_record_frames.py 5924 19935 \
+  --dataset-root src/data/ptbxl_vjepa_frames \
+  --black \
+  --thickness 2
+```
+
+`src/visualize_vjepa_logistic_patch_contributions.py` runs V-JEPA2 on a selected record and creates a video overlay showing patch-level quantities. It can visualize logistic contribution, V-JEPA feature norm, or cosine alignment between each patch token and the logistic-regression not-normal direction. The video also includes a top bar summarizing cumulative evidence or cosine alignment over time.
+
+Representative command:
+
+```bash
+python src/visualize_vjepa_logistic_patch_contributions.py \
+  --label normal \
+  --record 5924 \
+  --heatmap-mode cosine
+```
+
 ## Split Convention
 
 The supervised PTB-XL experiments use the official `strat_fold` split:
