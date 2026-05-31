@@ -1,4 +1,4 @@
-# PTB-XL V-JEPA2 ECG Pipeline
+# CAN V-JEPA2 READ ECG? A PTB-XL Classification Pipeline with V-JEPA2 Embeddings
 
 This repository contains a binary PTB-XL classification pipeline that starts from one raw ECG lead, converts the signal into image frames, extracts V-JEPA2 embeddings, and trains downstream predictors. The binary target is `normal rhythm` versus `not-normal rhythm`, where `normal rhythm` is assigned when the PTB-XL SCP labels contain `NORM`.
 
